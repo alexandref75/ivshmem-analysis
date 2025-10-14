@@ -30,12 +30,74 @@
 #define SHMEM_PATH "/dev/shm/ivshmem"
 #define SHMEM_SIZE (64 * 1024 * 1024)  // 64MB
 #define FRAME_SIZE (3840 * 2160 * 4)    // 4K RGBA frame (33MB)
+#define SECOND_NS 1000000000ULL
+
+
+#ifndef AARCH64_CMO_LOWLEVEL_H
+#define AARCH64_CMO_LOWLEVEL_H
+#endif
+
+#if !defined(__aarch64__)
+# error "This header requires AArch64."
+#endif
+
+#include <stdint.h>
+#include <stddef.h>
+
+#define SHM_ALIGNMENT 2*1024*1024
+
+static inline void flush_data_cache(char* start, char* end_exclusive) {
+
+    uint32_t ctr;
+    __asm__ volatile("mrs %x0, ctr_el0" : "=r"(ctr));
+
+    // Extract log2(line size) fields (DminLine[19:16], IminLine[3:0]); size = 4 << field
+    uint64_t dline = 4u << ((ctr >> 16) & 0xF);
+
+    start -= (uint64_t)start & (dline - 1);
+
+    if (start == end_exclusive)
+        end_exclusive++;
+
+    // Clean D-cache to Point of Unification for each affected D-line
+    for (char *p = start; p < (char *)end_exclusive; p += dline)
+	__asm__ volatile("dc cvac, %0" :: "r"(p) : "memory");
+
+    __asm__ volatile("dsb ish" ::: "memory");
+}
+
+static inline void invalidate_data_cache(char* start, char* end_exclusive) {
+
+    uint32_t ctr;
+    __asm__ volatile("mrs %x0, ctr_el0" : "=r"(ctr));
+
+    // Extract log2(line size) fields (DminLine[19:16], IminLine[3:0]); size = 4 << field
+    uint64_t dline = 4u << ((ctr >> 16) & 0xF);
+
+    start -= (uint64_t)start & (dline - 1);
+
+    if (start == end_exclusive)
+        end_exclusive++;
+
+    // Clean D-cache to Point of Unification for each affected D-line
+    for (char *p = start; p < (char *)end_exclusive; p += dline)
+	__asm__ volatile("dc civac, %0" :: "r"(p) : "memory");
+
+    __asm__ volatile("dsb ish" ::: "memory");
+}
+
+static void print_hash_data(const uint8_t *expected)
+{
+    printf("  Expected: ");
+    for (int i = 0; i < 32; i++) printf("%02x", expected[i]);
+    printf("\n");
+}
 
 static inline uint64_t get_time_ns(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+    return (uint64_t)ts.tv_sec * SECOND_NS + ts.tv_nsec;
 }
 
 // Debug logging function
@@ -57,6 +119,7 @@ static void set_host_state(volatile struct shared_data *shm, host_state_t new_st
     if (old_state != new_state) {
         printf("HOST STATE: %s -> %s\n", host_state_name(old_state), host_state_name(new_state));
         shm->host_state = (uint32_t)new_state;
+	//flush_data_cache((char*)&shm->host_state,(char*)&shm->host_state+sizeof(uint32_t));
         __sync_synchronize();
     }
 }
@@ -68,6 +131,7 @@ static host_state_t get_host_state(volatile struct shared_data *shm)
 
 static guest_state_t get_guest_state(volatile struct shared_data *shm)
 {
+    //invalidate_data_cache(&shm->guest_state,&shm->guest_state + sizeof(guest_state_t));
     return (guest_state_t)shm->guest_state;
 }
 
@@ -130,10 +194,22 @@ static void csv_close(csv_logger_t *logger)
 // Calculate SHA256 hash of buffer
 static void calculate_sha256(const uint8_t *data, size_t len, uint8_t *hash)
 {
-    SHA256_CTX ctx;
-    SHA256_Init(&ctx);
-    SHA256_Update(&ctx, data, len);
-    SHA256_Final(hash, &ctx);
+    EVP_MD_CTX *mdctx;
+    unsigned int size;
+
+    if((mdctx = EVP_MD_CTX_new()) == NULL) 
+        debug_log("Function EVP_MD_CTX_new return error");
+
+    if(1 != EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL))
+        debug_log("Function EVP_DigestInit_ex return error");
+
+    if(1 != EVP_DigestUpdate(mdctx, data, len))
+        debug_log("Function EVP_DigestUpdate return error");
+
+    if(1 != EVP_DigestFinal_ex(mdctx, hash, &size))
+        debug_log("Function EVP_DigestFinal_ex return error");
+
+    EVP_MD_CTX_free(mdctx);
 }
 
 // Generate random frame buffer (width x height x 24bpp)
@@ -219,6 +295,11 @@ void test_latency(volatile struct shared_data *shm, int iterations)
     // Pre-calculate SHA256 of test data
     uint8_t expected_hash[32];
     calculate_sha256(test_frame, frame_size, expected_hash);
+    print_hash_data(expected_hash);
+    printf("Frame begining:\n");
+    print_hash_data(test_frame);
+    printf("Frame end:\n");
+    print_hash_data(test_frame+(frame_size-32));
     
     printf("Test data ready. Starting measurements...\n\n");
     
@@ -249,6 +330,7 @@ void test_latency(volatile struct shared_data *shm, int iterations)
         // Reset error code
         shm->error_code = 0;
         __sync_synchronize();
+	//flush_data_cache((char *)&shm->error_code,(char *)&shm->error_code+sizeof(uint32_t));
         
         uint8_t *data_ptr = (uint8_t *)&shm->buffer[0];
         
@@ -256,6 +338,7 @@ void test_latency(volatile struct shared_data *shm, int iterations)
         shm->sequence = i;
         shm->data_size = frame_size;
         memcpy((void*)shm->data_sha256, expected_hash, 32);
+	//flush_data_cache((char *)&shm->data_sha256,(char *)&shm->data_sha256+32);
         __sync_synchronize();
         
         // MEASUREMENT 1: Host memcpy time + performance counters - THIS IS THE ACTUAL WRITE OVERHEAD
@@ -269,6 +352,7 @@ void test_latency(volatile struct shared_data *shm, int iterations)
         uint64_t memcpy_start = get_time_ns();
         
         memcpy((void*)data_ptr, test_frame, frame_size);
+	//flush_data_cache((char *)data_ptr,(char *)data_ptr+frame_size);
         __sync_synchronize(); // Ensure write completes before timing ends
         
         uint64_t memcpy_end = get_time_ns();
@@ -285,19 +369,19 @@ void test_latency(volatile struct shared_data *shm, int iterations)
         set_host_state(shm, HOST_STATE_SENDING);
         
         // Wait for guest to start processing
-        if (!wait_for_guest_state(shm, GUEST_STATE_PROCESSING, 1000000000ULL, "guest processing")) {
-            printf("  [%d] TIMEOUT (guest didn't start processing)\n", i);
-            if (csv && csv->file) {
-                fprintf(csv->file, "%d,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n", i);
-            }
-            if (perf_csv && perf_csv->file) {
-                fprintf(perf_csv->file, "%d,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n", i);
-            }
-            continue;
-        }
+        //if (!wait_for_guest_state(shm, GUEST_STATE_PROCESSING, 30*SECOND_NS, "guest processing")) {
+        //    printf("  [%d] TIMEOUT (guest didn't start processing)\n", i);
+        //    if (csv && csv->file) {
+        //        fprintf(csv->file, "%d,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n", i);
+        //    }
+        //    if (perf_csv && perf_csv->file) {
+        //        fprintf(perf_csv->file, "%d,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n", i);
+        //    }
+        //    continue;
+       // }
         
         // Wait for guest to finish processing
-        if (!wait_for_guest_state(shm, GUEST_STATE_ACKNOWLEDGED, 10000000000ULL, "guest acknowledged")) {
+        if (!wait_for_guest_state(shm, GUEST_STATE_ACKNOWLEDGED, 30*SECOND_NS, "guest acknowledged")) {
             printf("  [%d] TIMEOUT (guest didn't finish processing)\n", i);
             if (csv && csv->file) {
                 fprintf(csv->file, "%d,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n", i);
@@ -415,7 +499,7 @@ void test_latency(volatile struct shared_data *shm, int iterations)
         set_host_state(shm, HOST_STATE_READY);
         
         // Wait for guest to be ready for next message
-        if (!wait_for_guest_state(shm, GUEST_STATE_READY, 1000000000ULL, "guest ready for next")) {
+        if (!wait_for_guest_state(shm, GUEST_STATE_READY, 30*SECOND_NS, "guest ready for next")) {
             printf("  [%d] WARNING: Guest didn't return to ready state\n", i);
         }
     }
@@ -538,7 +622,8 @@ void test_bandwidth(volatile struct shared_data *shm, int iterations)
         
         uint8_t expected_hash[32];
         calculate_sha256(test_frame, frame_size, expected_hash);
-        
+	print_hash_data(expected_hash);
+
         double total_host_bw = 0.0, total_guest_bw = 0.0, total_overall_bw = 0.0;
         int successful = 0;
         
@@ -549,6 +634,7 @@ void test_bandwidth(volatile struct shared_data *shm, int iterations)
             memset((void *)&shm->timing, 0, sizeof(struct timing_data));
             shm->error_code = 0;
             __sync_synchronize();
+	    //flush_data_cache((char *)&shm->timing,(char *)&shm->timing+sizeof(struct timing_data));
             
             uint8_t *data_ptr = (uint8_t *)&shm->buffer[0];
             
@@ -556,6 +642,7 @@ void test_bandwidth(volatile struct shared_data *shm, int iterations)
             shm->sequence = 0xFFFF + iter;
             shm->data_size = frame_size;
             memcpy((void *)shm->data_sha256, expected_hash, 32);
+	    //flush_data_cache((char *)&shm->data_sha256,(char *)&shm->data_sha256+32);
             __sync_synchronize();
             
             // MEASURE: Host memcpy bandwidth + performance counters
@@ -568,6 +655,7 @@ void test_bandwidth(volatile struct shared_data *shm, int iterations)
             
             uint64_t memcpy_start = get_time_ns();
             memcpy((void*)data_ptr, test_frame, frame_size);
+	    //flush_data_cache((char *)data_ptr,(char *)data_ptr+frame_size);
             __sync_synchronize();
             uint64_t memcpy_end = get_time_ns();
             
@@ -580,7 +668,7 @@ void test_bandwidth(volatile struct shared_data *shm, int iterations)
             uint64_t roundtrip_start = get_time_ns();
             set_host_state(shm, HOST_STATE_SENDING);
             
-            if (!wait_for_guest_state(shm, GUEST_STATE_PROCESSING, 2000000000ULL, "guest processing")) {
+            if (!wait_for_guest_state(shm, GUEST_STATE_PROCESSING, 20*SECOND_NS, "guest processing")) {
                 printf("  [%d] TIMEOUT\n", iter + 1);
                 csv_write_bandwidth_result(csv, iter + 1, test_frames[frame_idx].name,
                                          width, height, 24, frame_size, 0, 0, 0, 0, false);
@@ -591,7 +679,7 @@ void test_bandwidth(volatile struct shared_data *shm, int iterations)
                 continue;
             }
             
-            if (!wait_for_guest_state(shm, GUEST_STATE_ACKNOWLEDGED, 10000000000ULL, "guest acknowledged")) {
+            if (!wait_for_guest_state(shm, GUEST_STATE_ACKNOWLEDGED, 20*SECOND_NS, "guest acknowledged")) {
                 printf("  [%d] TIMEOUT (processing)\n", iter + 1);
                 csv_write_bandwidth_result(csv, iter + 1, test_frames[frame_idx].name,
                                          width, height, 24, frame_size, 0, 0, 0, 0, false);
@@ -671,7 +759,7 @@ void test_bandwidth(volatile struct shared_data *shm, int iterations)
             
             set_host_state(shm, HOST_STATE_READY);
             
-            if (!wait_for_guest_state(shm, GUEST_STATE_READY, 1000000000ULL, "guest ready")) {
+            if (!wait_for_guest_state(shm, GUEST_STATE_READY, SECOND_NS, "guest ready")) {
                 printf("  WARNING: Guest didn't return to ready\n");
             }
             
@@ -724,7 +812,6 @@ void init_shared_memory(volatile struct shared_data *shm) {
     
     shm->magic = 0;
     set_host_state(shm, HOST_STATE_INITIALIZING);
-    __sync_synchronize();
     
     shm->sequence = 0;
     shm->data_size = 0;
@@ -732,16 +819,16 @@ void init_shared_memory(volatile struct shared_data *shm) {
     shm->test_complete = 0;
     memset((void*)shm->data_sha256, 0, 32);
     memset((void*)&shm->timing, 0, sizeof(struct timing_data));
+    //flush_data_cache((char *)&shm,(char *)&shm+sizeof(shm));
     __sync_synchronize();
     
     shm->magic = MAGIC;
     set_host_state(shm, HOST_STATE_READY);
-    __sync_synchronize();
     
     printf("HOST: Initialization complete - waiting for guest...\n");
     
-    if (!wait_for_guest_state(shm, GUEST_STATE_READY, 10000000000ULL, "guest ready")) {
-        printf("HOST: WARNING - Guest not ready within 10 seconds\n");
+    if (!wait_for_guest_state(shm, GUEST_STATE_READY, 100*SECOND_NS, "guest ready")) {
+        printf("HOST: WARNING - Guest not ready within 100 seconds\n");
         printf("HOST: Current guest state: %s\n", guest_state_name(get_guest_state(shm)));
         printf("HOST: Proceeding anyway...\n");
     } else {
@@ -794,6 +881,7 @@ int main(int argc, char *argv[])
     
     printf("Host Writer - ivshmem Performance Test with Overhead Analysis\n");
     printf("=============================================================\n\n");
+    printf("Opening file %s\n",SHMEM_PATH);
     
     int fd = open(SHMEM_PATH, O_RDWR);
     if (fd < 0) {
@@ -818,7 +906,7 @@ int main(int argc, char *argv[])
         return 1;
     }
     
-    volatile struct shared_data *shm = (volatile struct shared_data *)ptr;
+    volatile struct shared_data *shm = (volatile struct shared_data *)((char *)ptr + SHM_ALIGNMENT);
     
     printf("Mapped at address: %p\n", ptr);
     printf("Data buffer size: %zu bytes\n", 

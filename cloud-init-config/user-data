@@ -12,6 +12,8 @@ packages:
   - build-essential
   - gcc
   - make
+  - libssl-dev
+  - ndctl
 
 runcmd:
   - echo "VM setup complete" > /tmp/setup-complete

@@ -11,6 +11,7 @@
 #include <stdint.h>
 
 #define MAGIC 0xDEADBEEF
+#define MAGIC_CLIENT 0xBEEFDEAD
 
 // Host state machine states - only modified by host
 typedef enum {
@@ -84,6 +85,7 @@ struct timing_data {
 struct shared_data {
     // Initialization and termination control
     uint32_t magic;           // Magic number to verify sync (0 = initializing, MAGIC = ready)
+    uint32_t magic_client;    // Magic number to verify sync (0 = initializing, MAGIC = ready)
     uint32_t test_complete;   // 1 to signal test completion
     
     // State machine tracking (each side only modifies their own state)
@@ -93,7 +95,7 @@ struct shared_data {
     // Message data
     uint32_t sequence;        // Sequence number
     uint32_t data_size;       // Size of data in buffer
-    uint8_t  data_sha256[32]; // SHA256 of the data buffer
+    uint8_t  data_sha256[32] __attribute__((aligned(16))); // SHA256 of the data buffer
     uint32_t error_code;      // Error code if processing failed
     
     // Timing measurements for overhead analysis

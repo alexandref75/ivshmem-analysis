@@ -18,6 +18,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <openssl/evp.h>
 #include <openssl/sha.h>
 #include <stdbool.h>
 #include <stdarg.h>
@@ -26,8 +27,17 @@
 #include "common.h"
 #include "performance_counters.h"
 
-#define PCI_RESOURCE_PATH "/sys/bus/pci/devices/0000:00:03.0/resource2"
+//#define PCI_RESOURCE_PATH "/sys/bus/pci/devices/0000:00:03.0/resource2"
+#define PCI_RESOURCE_PATH "/dev/dax0.0"
 #define SHMEM_PATH "/dev/shm/ivshmem"
+
+// Print hash comparison for debugging
+static void print_hash_data(const uint8_t *expected)
+{
+    printf("  Expected: ");
+    for (int i = 0; i < 32; i++) printf("%02x", expected[i]);
+    printf("\n");
+}
 
 static inline uint64_t get_time_ns(void)
 {
@@ -55,6 +65,7 @@ static void set_guest_state(volatile struct shared_data *shm, guest_state_t new_
     if (old_state != new_state) {
         printf("GUEST STATE: %s -> %s\n", guest_state_name(old_state), guest_state_name(new_state));
         shm->guest_state = (uint32_t)new_state;
+	//__builtin___clear_cache((char *)&shm->guest_state,(char *)&shm->guest_state+sizeof(uint32_t));
         __sync_synchronize();
     }
 }
@@ -70,26 +81,28 @@ static host_state_t get_host_state(volatile struct shared_data *shm)
 }
 
 // Verify data integrity using SHA256
-static bool verify_data_integrity(const uint8_t *data, uint32_t size, const uint8_t *expected_hash)
+static bool verify_data_integrity(const uint8_t *data, uint32_t size, const uint8_t *expected_hash, uint8_t *calculated_hash)
 {
-    uint8_t calculated_hash[32];
-    SHA256_CTX ctx;
-    SHA256_Init(&ctx);
-    SHA256_Update(&ctx, data, size);
-    SHA256_Final(calculated_hash, &ctx);
+    EVP_MD_CTX *mdctx;
+    unsigned int hashlen;
+
+    if((mdctx = EVP_MD_CTX_new()) == NULL) 
+        debug_log("Function EVP_MD_CTX_new return error");
+
+    if(1 != EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL))
+        debug_log("Function EVP_DigestInit_ex return error");
+
+    if(1 != EVP_DigestUpdate(mdctx, data, size))
+        debug_log("Function EVP_DigestUpdate return error");
+
+    if(1 != EVP_DigestFinal_ex(mdctx, calculated_hash, &hashlen))
+        debug_log("Function EVP_DigestFinal_ex return error");
+
+    EVP_MD_CTX_free(mdctx);
     
     return memcmp(calculated_hash, expected_hash, 32) == 0;
 }
 
-// Print hash comparison for debugging
-static void print_hash_comparison(const uint8_t *expected, const uint8_t *calculated)
-{
-    printf("  Expected: ");
-    for (int i = 0; i < 32; i++) printf("%02x", expected[i]);
-    printf("\n  Got:      ");
-    for (int i = 0; i < 32; i++) printf("%02x", calculated[i]);
-    printf("\n");
-}
 
 // Cache flush function
 static void flush_cache_range(void *addr, size_t len) {
@@ -126,6 +139,16 @@ static void print_usage(const char *program_name)
     printf("\n");
 }
 
+// Print hash comparison for debugging
+static void print_hash_comparison(const uint8_t *expected, const uint8_t *calculated)
+{
+    printf("  Expected: ");
+    for (int i = 0; i < 32; i++) printf("%02x", expected[i]);
+    printf("\n  Got:      ");
+    for (int i = 0; i < 32; i++) printf("%02x", calculated[i]);
+    printf("\n");
+}
+
 void monitor_latency(volatile struct shared_data *shm, bool expect_latency, bool expect_bandwidth, int expected_count)
 {
     printf("Guest Reader - Monitoring for messages from host...\n");
@@ -139,6 +162,7 @@ void monitor_latency(volatile struct shared_data *shm, bool expect_latency, bool
     fflush(stdout);
     
     int message_count = 0;
+    uint8_t calculated_hash[32];
     
     // STATE: GUEST_STATE_UNINITIALIZED -> GUEST_STATE_WAITING_HOST_INIT
     set_guest_state(shm, GUEST_STATE_WAITING_HOST_INIT);
@@ -178,9 +202,6 @@ void monitor_latency(volatile struct shared_data *shm, bool expect_latency, bool
     
     printf("GUEST: ✓ Host initialization complete - ready for messages.\n\n");
     
-    // STATE: GUEST_STATE_WAITING_HOST_INIT -> GUEST_STATE_READY
-    set_guest_state(shm, GUEST_STATE_READY);
-    
     // Allocate local buffer for memcpy (reuse for all messages)
     // Max size for 4K frame
     size_t max_buffer_size = 3840 * 2160 * 3;
@@ -199,6 +220,9 @@ void monitor_latency(volatile struct shared_data *shm, bool expect_latency, bool
         printf("GUEST: ⚠ Hardware performance counters not available\n");
         printf("  Cache miss analysis will be limited\n\n");
     }
+    
+    // STATE: GUEST_STATE_WAITING_HOST_INIT -> GUEST_STATE_READY
+    set_guest_state(shm, GUEST_STATE_READY);
     
     while (message_count < expected_count) {
         if (shm->test_complete == 1) {
@@ -285,7 +309,7 @@ void monitor_latency(volatile struct shared_data *shm, bool expect_latency, bool
         
         // PHASE B: PURE READ (COLD CACHE) - Read shared memory after cache flush
         // Flush cache lines for the shared memory to force memory access
-        flush_cache_range(data_ptr, data_size);
+        //flush_cache_range(data_ptr, data_size);
         
         uint64_t cold_read_start = get_time_ns();
         
@@ -300,7 +324,7 @@ void monitor_latency(volatile struct shared_data *shm, bool expect_latency, bool
         
         // PHASE C: READ+WRITE (COLD CACHE) - memcpy after cache flush to measure write overhead
         // Flush cache again to ensure we're measuring from cold state
-        flush_cache_range(data_ptr, data_size);
+        //flush_cache_range(data_ptr, data_size);
         
         uint64_t memcpy_start = get_time_ns();
         
@@ -320,8 +344,8 @@ void monitor_latency(volatile struct shared_data *shm, bool expect_latency, bool
         
         // PHASE D: SHA256 INTEGRITY CHECK - SHA256 with data in local cache
         uint64_t verify_start = get_time_ns();
-        
-        bool hash_match = verify_data_integrity(local_buffer, data_size, expected_hash);
+
+        bool hash_match = verify_data_integrity(local_buffer, data_size, expected_hash, calculated_hash);
         
         uint64_t verify_end = get_time_ns();
         uint64_t cached_verify_duration = verify_end - verify_start;
@@ -365,6 +389,7 @@ void monitor_latency(volatile struct shared_data *shm, bool expect_latency, bool
         shm->timing.guest_perf.cycles_per_byte_x10000 = (uint32_t)(guest_perf_results.cycles_per_byte * 10000.0);
         shm->timing.guest_perf.tlb_miss_rate_x10000 = (uint32_t)(guest_perf_results.tlb_miss_rate * 10000.0);
         
+        //__builtin___clear_cache((char *)&shm->timing,(char *)&shm->timing+sizeof(struct timing_data));
         __sync_synchronize();
         
         // Display results with performance metrics
@@ -411,12 +436,15 @@ void monitor_latency(volatile struct shared_data *shm, bool expect_latency, bool
             printf("✓ Data integrity verified: SHA256 match\n");
         } else {
             printf("✗ Data integrity check FAILED: SHA256 mismatch\n");
-            uint8_t calculated_hash[32];
-            SHA256_CTX ctx;
-            SHA256_Init(&ctx);
-            SHA256_Update(&ctx, local_buffer, data_size);
-            SHA256_Final(calculated_hash, &ctx);
             print_hash_comparison(expected_hash, calculated_hash);
+	    printf("Begin buffer shared\n");
+	    print_hash_data(data_ptr);
+	    printf("End buffer shared\n");
+	    print_hash_data(data_ptr+(data_size-32));
+	    printf("Begin buffer local\n");
+	    print_hash_data(local_buffer);
+	    printf("End buffer local\n");
+	    print_hash_data(local_buffer+(data_size-32));
             success = false;
             error_code = 1;
         }
@@ -432,6 +460,7 @@ cleanup_and_continue:
         
         if (!success) {
             shm->error_code = error_code;
+	    //__builtin___clear_cache((char *)&shm->error_code,(char *)&shm->error_code+sizeof(uint32_t));
             __sync_synchronize();
         }
         
@@ -545,19 +574,20 @@ int main(int argc, char *argv[])
     }
     
     // Get resource size
-    if (fstat(fd, &st) < 0) {
-        perror("fstat");
-        close(fd);
-        return 1;
-    }
+    //if (fstat(fd, &st) < 0) {
+     //   perror("fstat");
+      //  close(fd);
+       // return 1;
+    //}
     
-    printf("Resource: %s\n", device_path);
-    printf("Resource size: %ld bytes (%ld MB)\n", 
-           st.st_size, st.st_size / (1024 * 1024));
-    fflush(stdout);
+    //printf("Resource: %s\n", device_path);
+    //printf("Resource size: %ld bytes (%ld MB)\n", 
+    //       st.st_size, st.st_size / (1024 * 1024));
+    //fflush(stdout);
     
     // Map memory
-    void *ptr = mmap(NULL, st.st_size, PROT_READ | PROT_WRITE, 
+    //void *ptr = mmap(NULL, st.st_size, PROT_READ | PROT_WRITE, 
+    void *ptr = mmap(NULL, 64*1024*1024, PROT_READ | PROT_WRITE, 
                      MAP_SHARED, fd, 0);
     if (ptr == MAP_FAILED) {
         perror("mmap");
@@ -571,6 +601,11 @@ int main(int argc, char *argv[])
     
     // Initialize guest state
     set_guest_state(shm, GUEST_STATE_UNINITIALIZED);
+
+    if (shm->magic_client != MAGIC_CLIENT) {
+	printf("client magic not set\n");
+	shm->magic_client = MAGIC_CLIENT;
+    }
     
     printf("Mapped at address: %p\n", ptr);
     printf("Ready to receive data from host.\n\n");
@@ -578,6 +613,7 @@ int main(int argc, char *argv[])
     
     printf("Initial values:\n");
     printf("  Magic: 0x%08X\n", shm->magic);
+    printf("  Magic_client: 0x%08X\n", shm->magic_client);
     printf("  Sequence: %u\n", shm->sequence);
     printf("  Data size: %u\n", shm->data_size);
     printf("  Error code: %u\n", shm->error_code);
