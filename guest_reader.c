@@ -31,6 +31,58 @@
 #define PCI_RESOURCE_PATH "/dev/dax0.0"
 #define SHMEM_PATH "/dev/shm/ivshmem"
 
+#ifndef AARCH64_CMO_LOWLEVEL_H
+#define AARCH64_CMO_LOWLEVEL_H
+#endif
+
+#if !defined(__aarch64__)
+# error "This header requires AArch64."
+#endif
+
+#include <stdint.h>
+#include <stddef.h>
+
+#define SHM_ALIGNMENT 2*1024*1024
+
+static inline void flush_data_cache(char* start, char* end_exclusive) {
+
+    uint32_t ctr;
+    __asm__ volatile("mrs %x0, ctr_el0" : "=r"(ctr));
+
+    // Extract log2(line size) fields (DminLine[19:16], IminLine[3:0]); size = 4 << field
+    uint64_t dline = 4u << ((ctr >> 16) & 0xF);
+
+    start -= (uint64_t)start & (dline - 1);
+
+    if (start == end_exclusive)
+        end_exclusive++;
+
+    // Clean D-cache to Point of Unification for each affected D-line
+    for (char *p = start; p < (char *)end_exclusive; p += dline)
+	__asm__ volatile("dc cvac, %0" :: "r"(p) : "memory");
+
+    __asm__ volatile("dsb ish" ::: "memory");
+}
+
+static inline void invalidate_data_cache(char* start, char* end_exclusive) {
+
+    uint32_t ctr;
+    __asm__ volatile("mrs %x0, ctr_el0" : "=r"(ctr));
+
+    // Extract log2(line size) fields (DminLine[19:16], IminLine[3:0]); size = 4 << field
+    uint64_t dline = 4u << ((ctr >> 16) & 0xF);
+
+    start -= (uint64_t)start & (dline - 1);
+
+    if (start == end_exclusive)
+        end_exclusive++;
+
+    // Clean D-cache to Point of Unification for each affected D-line
+    for (char *p = start; p < (char *)end_exclusive; p += dline)
+	__asm__ volatile("dc civac, %0" :: "r"(p) : "memory");
+
+    __asm__ volatile("dsb ish" ::: "memory");
+}
 // Print hash comparison for debugging
 static void print_hash_data(const uint8_t *expected)
 {
@@ -65,7 +117,7 @@ static void set_guest_state(volatile struct shared_data *shm, guest_state_t new_
     if (old_state != new_state) {
         printf("GUEST STATE: %s -> %s\n", guest_state_name(old_state), guest_state_name(new_state));
         shm->guest_state = (uint32_t)new_state;
-	//__builtin___clear_cache((char *)&shm->guest_state,(char *)&shm->guest_state+sizeof(uint32_t));
+	invalidate_data_cache((char *)&shm->guest_state,(char *)&shm->guest_state+sizeof(uint32_t));
         __sync_synchronize();
     }
 }
@@ -328,7 +380,11 @@ void monitor_latency(volatile struct shared_data *shm, bool expect_latency, bool
         
         uint64_t memcpy_start = get_time_ns();
         
-        memcpy(measurement_buffer, data_ptr, data_size);
+        if (memchr(data_ptr, 255, data_size) != NULL) {
+	   printf("Found 255 on the buffer, it should not have one \n");
+	   exit(1);
+	}
+	invalidate_data_cache((char *)data_ptr,(char *)data_ptr + data_size);
         __sync_synchronize(); // Ensure memcpy completes
         
         uint64_t memcpy_end = get_time_ns();
@@ -340,12 +396,12 @@ void monitor_latency(volatile struct shared_data *shm, bool expect_latency, bool
         }
         
         // Copy final data to local buffer for verification (using the memcpy result)
-        memcpy(local_buffer, measurement_buffer, data_size);
+        //memcpy(local_buffer, measurement_buffer, data_size);
         
         // PHASE D: SHA256 INTEGRITY CHECK - SHA256 with data in local cache
         uint64_t verify_start = get_time_ns();
 
-        bool hash_match = verify_data_integrity(local_buffer, data_size, expected_hash, calculated_hash);
+        bool hash_match = verify_data_integrity(data_ptr, data_size, expected_hash, calculated_hash);
         
         uint64_t verify_end = get_time_ns();
         uint64_t cached_verify_duration = verify_end - verify_start;
@@ -389,7 +445,7 @@ void monitor_latency(volatile struct shared_data *shm, bool expect_latency, bool
         shm->timing.guest_perf.cycles_per_byte_x10000 = (uint32_t)(guest_perf_results.cycles_per_byte * 10000.0);
         shm->timing.guest_perf.tlb_miss_rate_x10000 = (uint32_t)(guest_perf_results.tlb_miss_rate * 10000.0);
         
-        //__builtin___clear_cache((char *)&shm->timing,(char *)&shm->timing+sizeof(struct timing_data));
+        invalidate_data_cache((char *)&shm->timing,(char *)&shm->timing+sizeof(struct timing_data));
         __sync_synchronize();
         
         // Display results with performance metrics
@@ -441,10 +497,6 @@ void monitor_latency(volatile struct shared_data *shm, bool expect_latency, bool
 	    print_hash_data(data_ptr);
 	    printf("End buffer shared\n");
 	    print_hash_data(data_ptr+(data_size-32));
-	    printf("Begin buffer local\n");
-	    print_hash_data(local_buffer);
-	    printf("End buffer local\n");
-	    print_hash_data(local_buffer+(data_size-32));
             success = false;
             error_code = 1;
         }
@@ -460,7 +512,7 @@ cleanup_and_continue:
         
         if (!success) {
             shm->error_code = error_code;
-	    //__builtin___clear_cache((char *)&shm->error_code,(char *)&shm->error_code+sizeof(uint32_t));
+	    invalidate_data_cache((char *)&shm->error_code,(char *)&shm->error_code+sizeof(uint32_t));
             __sync_synchronize();
         }
         

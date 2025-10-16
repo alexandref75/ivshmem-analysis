@@ -27,7 +27,8 @@
 #include "common.h"
 #include "performance_counters.h"
 
-#define SHMEM_PATH "/dev/shm/ivshmem"
+//#define SHMEM_PATH "/dev/shm/ivshmem"
+#define SHMEM_PATH "/dev/hugepages/ivshmem"
 #define SHMEM_SIZE (64 * 1024 * 1024)  // 64MB
 #define FRAME_SIZE (3840 * 2160 * 4)    // 4K RGBA frame (33MB)
 #define SECOND_NS 1000000000ULL
@@ -45,6 +46,7 @@
 #include <stddef.h>
 
 #define SHM_ALIGNMENT 2*1024*1024
+//#define SHM_ALIGNMENT 0
 
 static inline void flush_data_cache(char* start, char* end_exclusive) {
 
@@ -119,7 +121,7 @@ static void set_host_state(volatile struct shared_data *shm, host_state_t new_st
     if (old_state != new_state) {
         printf("HOST STATE: %s -> %s\n", host_state_name(old_state), host_state_name(new_state));
         shm->host_state = (uint32_t)new_state;
-	//flush_data_cache((char*)&shm->host_state,(char*)&shm->host_state+sizeof(uint32_t));
+	invalidate_data_cache((char*)&shm->host_state,(char*)&shm->host_state+sizeof(uint32_t));
         __sync_synchronize();
     }
 }
@@ -227,6 +229,9 @@ static void generate_random_frame(uint8_t *buffer, int width, int height) {
         
         for (size_t i = 0; i < frame_size; i++) {
             buffer[i] = rand() & 0xFF;
+	    if (buffer[i]==255) {
+		buffer[i]=0;
+            }
         }
     }
 }
@@ -291,7 +296,18 @@ void test_latency(volatile struct shared_data *shm, int iterations)
     }
     
     generate_random_frame(test_frame, width, height);
-    
+
+    char *char_ptr = (char *)test_frame;
+    size_t cur_frame_size  = frame_size;
+    while (((char_ptr = (char*)(memchr(char_ptr,255,cur_frame_size))) != NULL) && (cur_frame_size > 0)) {
+        *char_ptr = 0;
+	cur_frame_size = frame_size-((char *)test_frame - char_ptr);
+    }
+
+    if (memchr(test_frame,255,frame_size) != NULL) {
+	printf("ERROR: 255 found on frame\n");
+	exit(1);
+     }
     // Pre-calculate SHA256 of test data
     uint8_t expected_hash[32];
     calculate_sha256(test_frame, frame_size, expected_hash);
@@ -329,8 +345,8 @@ void test_latency(volatile struct shared_data *shm, int iterations)
         
         // Reset error code
         shm->error_code = 0;
+	invalidate_data_cache((char *)&shm->error_code,(char *)&shm->error_code+sizeof(uint32_t));
         __sync_synchronize();
-	//flush_data_cache((char *)&shm->error_code,(char *)&shm->error_code+sizeof(uint32_t));
         
         uint8_t *data_ptr = (uint8_t *)&shm->buffer[0];
         
@@ -338,7 +354,7 @@ void test_latency(volatile struct shared_data *shm, int iterations)
         shm->sequence = i;
         shm->data_size = frame_size;
         memcpy((void*)shm->data_sha256, expected_hash, 32);
-	//flush_data_cache((char *)&shm->data_sha256,(char *)&shm->data_sha256+32);
+	invalidate_data_cache((char *)&shm->data_sha256,(char *)&shm->data_sha256+32);
         __sync_synchronize();
         
         // MEASUREMENT 1: Host memcpy time + performance counters - THIS IS THE ACTUAL WRITE OVERHEAD
@@ -352,7 +368,7 @@ void test_latency(volatile struct shared_data *shm, int iterations)
         uint64_t memcpy_start = get_time_ns();
         
         memcpy((void*)data_ptr, test_frame, frame_size);
-	//flush_data_cache((char *)data_ptr,(char *)data_ptr+frame_size);
+	invalidate_data_cache((char *)data_ptr,(char *)data_ptr+frame_size);
         __sync_synchronize(); // Ensure write completes before timing ends
         
         uint64_t memcpy_end = get_time_ns();
@@ -619,6 +635,15 @@ void test_bandwidth(volatile struct shared_data *shm, int iterations)
         }
         
         generate_random_frame(test_frame, width, height);
+
+	if (memchr(test_frame,255,frame_size) != NULL) {
+            printf("ERROR: 255 found on frame\n");
+	    exit(1);
+	 }
+	//char *char_ptr = (char *)test_frame;
+	//while ((char_ptr = (char*)(memchr(char_ptr,255,frame_size-((char *)test_frame-char_ptr)))) != NULL) {
+	//    *char_ptr = 0;
+//	}
         
         uint8_t expected_hash[32];
         calculate_sha256(test_frame, frame_size, expected_hash);
@@ -633,8 +658,8 @@ void test_bandwidth(volatile struct shared_data *shm, int iterations)
             // Clear timing
             memset((void *)&shm->timing, 0, sizeof(struct timing_data));
             shm->error_code = 0;
+	    invalidate_data_cache((char *)&shm->timing,(char *)&shm->timing+sizeof(struct timing_data));
             __sync_synchronize();
-	    //flush_data_cache((char *)&shm->timing,(char *)&shm->timing+sizeof(struct timing_data));
             
             uint8_t *data_ptr = (uint8_t *)&shm->buffer[0];
             
@@ -642,7 +667,7 @@ void test_bandwidth(volatile struct shared_data *shm, int iterations)
             shm->sequence = 0xFFFF + iter;
             shm->data_size = frame_size;
             memcpy((void *)shm->data_sha256, expected_hash, 32);
-	    //flush_data_cache((char *)&shm->data_sha256,(char *)&shm->data_sha256+32);
+	    invalidate_data_cache((char *)&shm->data_sha256,(char *)&shm->data_sha256+32);
             __sync_synchronize();
             
             // MEASURE: Host memcpy bandwidth + performance counters
@@ -655,7 +680,7 @@ void test_bandwidth(volatile struct shared_data *shm, int iterations)
             
             uint64_t memcpy_start = get_time_ns();
             memcpy((void*)data_ptr, test_frame, frame_size);
-	    //flush_data_cache((char *)data_ptr,(char *)data_ptr+frame_size);
+	    invalidate_data_cache((char *)data_ptr,(char *)data_ptr+frame_size);
             __sync_synchronize();
             uint64_t memcpy_end = get_time_ns();
             
@@ -819,7 +844,7 @@ void init_shared_memory(volatile struct shared_data *shm) {
     shm->test_complete = 0;
     memset((void*)shm->data_sha256, 0, 32);
     memset((void*)&shm->timing, 0, sizeof(struct timing_data));
-    //flush_data_cache((char *)&shm,(char *)&shm+sizeof(shm));
+    invalidate_data_cache((char *)&shm,(char *)&shm+sizeof(shm));
     __sync_synchronize();
     
     shm->magic = MAGIC;
@@ -933,7 +958,6 @@ int main(int argc, char *argv[])
     
     set_host_state(shm, HOST_STATE_COMPLETED);
     shm->test_complete = 1;
-    __sync_synchronize();
     
     munmap(ptr, st.st_size);
     close(fd);

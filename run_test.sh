@@ -24,6 +24,61 @@ set -e  # Exit on any error
 newline() {
     echo ""
 }
+echo "=== IVSHMEM Performance Test ==="
+echo ""
+
+: ${IVSHMEM_SIZE:=64}
+: ${VM_NAME:="ivshmem-vm"}
+: ${VM_DISK:="ivshmem-disk.qcow2"}
+: ${CLOUD_IMAGE:="debian-12-generic-amd64.qcow2"}
+: ${CLOUD_IMAGE_URL:="https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.qcow2"}
+: ${CERTIFICATE_FILE:="temp_id_rsa"}
+: ${SHMEM_FILE:="./ivshmem-shmem"}
+
+# Configuration
+IVSHMEM_SIZE=64
+SHMEM_PATH="/dev/shm/ivshmem"
+SHMEM_FALLBACK="./ivshmem-shmem"
+SSH_OPTS="-q -i ${CERTIFICATE_FILE} -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+SCP_OPTS="-i ${CERTIFICATE_FILE} -P 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+VM_USER="debian@localhost"
+
+# Detect OS
+OS=$(uname -o)
+ARCH_M=$(uname -m)
+case ${ARCH_M} in
+        x86_64)
+		: ${KVM_MACHINE_TYPE:="pc"}
+                ARCH_GEN=amd64
+                ARCH=amd64;;
+        arm64|aarch64)
+		: ${KVM_MACHINE_TYPE:="virt"}
+                ARCH=arm64
+                ARCH_GEN=arm
+                ARCH_M=aarch64;;
+        *)
+		: ${KVM_MACHINE_TYPE:="pc"}
+                ARCH=${ARCH_M}
+                ARCH_GEN=${ARCH_M};;
+esac
+: ${QEMU_PATH:="/usr/bin/qemu-system-${ARCH_M}"}
+
+
+# Create shared memory file
+if [ "$OS" = "Darwin" ]; then
+  # macOS: use local file
+  SHMEM_PATH=$SHMEM_FILE
+else
+  # Linux: use /dev/shm if available, otherwise local file
+  if [ -d /dev/shm ]; then
+    SHMEM_PATH=/dev/shm/ivshmem
+  else
+    SHMEM_PATH=$SHMEM_FILE
+  fi
+fi
+  
+# Configuration
+SHMEM_FALLBACK="./ivshmem-shmem"
 
 # Colors for output
 RED='\033[0;31m'
@@ -67,14 +122,6 @@ if [[ "$1" == "-h" || "$1" == "--help" ]]; then
     show_usage
 fi
 
-# Configuration
-IVSHMEM_SIZE=64
-SHMEM_PATH="/dev/shm/ivshmem"
-SHMEM_FALLBACK="./ivshmem-shmem"
-SSH_KEY="temp_id_rsa"
-SSH_OPTS="-i $SSH_KEY -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
-SCP_OPTS="-i $SSH_KEY -P 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
-VM_USER="debian@localhost"
 
 # Parse test counts from command line arguments
 LAT_COUNT=${1:-1000}      # Default 1000 latency tests
@@ -136,14 +183,14 @@ fi
 
 # Sanity Check 1: VM is running
 echo "Checking VM status..."
-if ! pgrep -f qemu-system-x86_64 > /dev/null; then
+if ! pgrep -F pidfile.pid > /dev/null; then
     error "VM is not running! Start it first with: ./setup.sh"
 fi
 success "VM is running"
 
 # Sanity Check 2: ivshmem support
 echo "Checking ivshmem support..."
-if ! pgrep -f "qemu-system-x86_64.*ivshmem" > /dev/null; then
+if ! pgrep -f "${QEMU_PATH}.*ivshmem" > /dev/null; then
     warning "VM may not have ivshmem support enabled"
     warning "Performance tests may not work correctly"
 else
@@ -168,11 +215,20 @@ fi
 success "VM build environment OK"
 
 # Sanity Check 5: ivshmem device in VM
-echo "Checking ivshmem device in VM..."
-if ! ssh $SSH_OPTS $VM_USER 'test -e /sys/bus/pci/devices/0000:00:03.0/resource2'; then
-    error "ivshmem PCI device not found in VM. VM may not have ivshmem support."
+echo "Checking /dev/dax0.0 device in VM..."
+if ! ssh $SSH_OPTS $VM_USER 'test -e /dev/dax0.0'; then
+    echo "/dev/dax0.0 does not exist, trying to create..."
+    # Sanity Check 5: ivshmem device in VM
+    if ! ssh $SSH_OPTS $VM_USER 'sudo ndctl create-namespace --mode devdax --map mem -e namespace0.0 -f'; then
+	echo "Checking ivshmem device in VM..."
+	if ! ssh $SSH_OPTS $VM_USER 'test -e /sys/bus/pci/devices/0000:00:03.0/resource2'; then
+	    error "ivshmem PCI device not found in VM. VM may not have ivshmem support."
+	fi
+	success "ivshmem PCI device found in VM"
+    fi
+    success "/dev/dax0,0 created on VM"
 fi
-success "ivshmem PCI device found in VM"
+success "dax0.0 device found in VM"
 
 # Sanity Check 6: Host build environment
 echo "Checking host build environment..."
@@ -354,6 +410,8 @@ if [ $LAT_COUNT -gt 0 ]; then
   else
       warning "Latency test completed with issues"
   fi
+
+  exit 1
 
   # Cleanup latency guest (handle gracefully even if process already exited)
   echo "Cleaning up latency guest process..."

@@ -6,6 +6,35 @@
 # maps to shared memory accessible by both host and guest.
 
 # Needs to work on both ARM64 and x86_64 architecture. Linux only, as ivshmem is not available on macOS.
+# Detect OS
+OS=$(uname -o)
+ARCH_M=$(uname -m)
+case ${ARCH_M} in
+        x86_64)
+		: ${KVM_MACHINE_TYPE:="pc"}
+                ARCH_GEN=amd64
+                ARCH=amd64;;
+        arm64|aarch64)
+		: ${KVM_MACHINE_TYPE:="virt"}
+                ARCH=arm64
+                ARCH_GEN=arm
+                ARCH_M=aarch64;;
+        *)
+		: ${KVM_MACHINE_TYPE:="pc"}
+                ARCH=${ARCH_M}
+                ARCH_GEN=${ARCH_M};;
+esac
+
+# Variables
+: ${IVSHMEM_SIZE:=64}
+: ${VM_NAME:="ivshmem-vm"}
+: ${VM_DISK:="ivshmem-disk.qcow2"}
+: ${CLOUD_IMAGE:="debian-12-generic-${ARCH}.qcow2"}
+: ${CLOUD_IMAGE_URL:="https://cloud.debian.org/images/cloud/bookworm/latest/${CLOUD_IMAGE}"}
+: ${CERTIFICATE_FILE:="temp_id_rsa"}
+: ${SHMEM_FILE:="./ivshmem-shmem"}
+
+: ${QEMU_PATH:="/usr/bin/qemu-system-${ARCH_M}"}
 
 # CPU PINNING OPTIMIZATION:
 # This script supports CPU pinning to minimize VM exits and context switches by isolating
@@ -18,27 +47,10 @@
 #   4-5 cores: VM=2-3, Host=0-1
 #   6-7 cores: VM=2-4, Host=0-1,5
 #   8+ cores:  VM=2-5, Host=0-1,6-7
-
-# Variables
-IVSHMEM_SIZE=64
-VM_NAME="ivshmem-vm"
-VM_DISK="ivshmem-disk.qcow2"
-CLOUD_IMAGE="debian-12-generic-amd64.qcow2"
-CLOUD_IMAGE_URL="https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.qcow2"
-CERTIFICATE_FILE="temp_id_rsa"
-SHMEM_FILE="./ivshmem-shmem"
-QEMU_PATH="/usr/bin/qemu-system-x86_64"
-
-# CPU Pinning Configuration
-# Set VM_CPU_CORES to specify which cores to pin the VM to (e.g., "2-3" or "2,3")
-# Set HOST_CPU_CORES to specify which cores to pin host processes to (e.g., "0-1" or "0,1")
-# Leave empty to disable CPU pinning
 VM_CPU_CORES="${VM_CPU_CORES:-}"
 HOST_CPU_CORES="${HOST_CPU_CORES:-}"
 VM_VCPU_COUNT="${VM_VCPU_COUNT:-2}"  # Number of virtual CPUs for the VM
 
-# Detect OS
-OS=$(uname -s)
 
 # CPU topology detection and auto-configuration
 detect_cpu_topology() {
@@ -90,15 +102,18 @@ if [ "$OS" = "Darwin" ]; then
   SHMEM_PATH=$SHMEM_FILE
 else
   # Linux: use /dev/shm if available, otherwise local file
-  if [ -d /dev/shm ]; then
+  if [ -d /dev/hugepages ]; then
+    echo "Creating shared memory file: /dev/hugepages/ivshmem (${IVSHMEM_SIZE}MB)"
+    SHMEM_PATH=/dev/hugepages/ivshmem
+  elif [ -d /dev/shm ]; then
     echo "Creating shared memory file: /dev/shm/ivshmem (${IVSHMEM_SIZE}MB)"
-    dd if=/dev/zero of=/dev/shm/ivshmem bs=1M count=$IVSHMEM_SIZE
     SHMEM_PATH=/dev/shm/ivshmem
   else
     echo "Creating shared memory file: $SHMEM_FILE (${IVSHMEM_SIZE}MB)"
-    dd if=/dev/zero of=$SHMEM_FILE bs=1M count=$IVSHMEM_SIZE
     SHMEM_PATH=$SHMEM_FILE
   fi
+  #sudo dd if=/dev/zero of=$SHMEM_PATH bs=1M count=$IVSHMEM_SIZE
+  sudo chmod a+rw $SHMEM_PATH 
   
   # Check if KVM is accessible
   if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
@@ -116,11 +131,11 @@ else
   fi
 fi
 
-# Make sure we have the qemu-system-x86_64 command
+# Make sure we have the qemu-system-${ARCH_M} command
 which $QEMU_PATH > /dev/null
 if [ $? -ne 0 ]; then
-  echo "qemu-system-x86_64 not found"
-  echo "Install with: brew install qemu (macOS) or apt-get install qemu-system-x86 (Linux)"
+  echo "qemu-system-${ARCH_M} not found"
+  echo "Install with: brew install qemu (macOS) or apt-get install qemu-system (Linux)"
   exit 1
 fi
 
@@ -189,6 +204,8 @@ packages:
   - build-essential
   - gcc
   - make
+  - libssl-dev
+  - ndctl
 
 runcmd:
   - echo "VM setup complete" > /tmp/setup-complete
@@ -219,17 +236,17 @@ else
     echo "  - Use Linux instead (ivshmem is typically not in macOS QEMU builds)"
     echo "  - Or compile QEMU from source with --enable-ivshmem"
   else
-    echo "  - Install qemu-system with ivshmem: apt-get install qemu-system-x86"
+    echo "  - Install qemu-system with ivshmem: apt-get install qemu-system"
     echo "  - Or compile QEMU from source with --enable-ivshmem"
   fi
   echo ""
 fi
 
 # Check if VM is already running
-if pgrep -f "qemu-system-x86_64.*ivshmem" > /dev/null; then
+if pgrep -f "qemu-system-${ARCH_M}.*ivshmem" > /dev/null; then
   echo "VM appears to already be running with ivshmem."
   echo "If you want to restart it, kill the existing process first:"
-  echo "  pkill -f qemu-system-x86_64"
+  echo "  pkill -f qemu-system-${ARCH_M}"
   echo ""
   echo "To run tests with the existing VM:"
   echo "  ./run_test.sh"
@@ -250,36 +267,49 @@ fi
 if [ $HAS_IVSHMEM -eq 1 ]; then
   # With ivshmem support - shared memory will be created by run_test.sh
   echo "Starting VM with ivshmem support..."
-  $CPU_PINNING_CMD $QEMU_PATH \
-    -machine q35 \
+  $QEMU_PATH \
+    -M nvdimm=on \
+    -machine ${KVM_MACHINE_TYPE} \
     $CPU_FLAG \
     $ACCEL_FLAG \
-    -m 2048 \
+    -m 4096m,slots=2,maxmem=6144m \
+    -cpu host \
     -smp cpus=$VM_VCPU_COUNT,maxcpus=$VM_VCPU_COUNT \
-    -drive file=$VM_DISK,format=qcow2,if=virtio \
+    -pidfile pidfile.pid \
+    -drive if=pflash,format=raw,readonly=on,file=/usr/share/AAVMF/AAVMF_CODE.fd \
+    -drive if=none,format=qcow2,file=$VM_DISK,id=hd0 \
+    -device virtio-blk-pci,drive=hd0 \
     -drive file=$CLOUD_INIT_ISO,format=raw,if=virtio \
     -device virtio-net-pci,netdev=net0 \
     -netdev user,id=net0,hostfwd=tcp::2222-:22 \
     -object memory-backend-file,id=hostmem,mem-path=$SHMEM_PATH,size=${IVSHMEM_SIZE}M,share=on \
-    -device ivshmem-plain,memdev=hostmem \
-    -nographic &
+    -device nvdimm,memdev=hostmem \
+    -nographic > qemu.log 2>&1 &
+    # -device nvdimm,memdev=hostmem,label-size=2M \
+    #-device ivshmem-plain,memdev=hostmem \
 else
   # Without ivshmem (fallback)
   echo "Starting VM without ivshmem (limited functionality)..."
   $CPU_PINNING_CMD $QEMU_PATH \
-    -machine q35 \
+    -machine ${KVM_MACHINE_TYPE} \
     $CPU_FLAG \
     $ACCEL_FLAG \
-    -m 2048 \
+    -pidfile pidfile.pid \
+    -m 4096 \
     -smp cpus=$VM_VCPU_COUNT,maxcpus=$VM_VCPU_COUNT \
     -drive file=$VM_DISK,format=qcow2,if=virtio \
     -drive file=$CLOUD_INIT_ISO,format=raw,if=virtio \
     -device virtio-net-pci,netdev=net0 \
     -netdev user,id=net0,hostfwd=tcp::2222-:22 \
-    -nographic &
+    -nographic > qemu.log 2>&1 &
 fi
 
-QEMU_PID=$!
+sleep 5
+if [ ! -e pidfile.pid ];then
+	echo "QEMU did not start"
+	exit 1
+fi
+QEMU_PID=$(cat pidfile.pid)
 echo "QEMU started with PID $QEMU_PID"
 echo "Checking if VM started successfully..."
 
@@ -328,6 +358,6 @@ echo "  ssh -i $CERTIFICATE_FILE -p 2222 debian@localhost"
 echo ""
 echo "To stop the VM:"
 echo "  kill $QEMU_PID"
-echo "  # or: pkill -f qemu-system-x86_64"
+echo "  # or: pkill -f qemu-system-${ARCH_M}"
 echo ""
 
