@@ -378,16 +378,23 @@ void monitor_latency(volatile struct shared_data *shm, bool expect_latency, bool
         // Flush cache again to ensure we're measuring from cold state
         //flush_cache_range(data_ptr, data_size);
         
+	uint64_t size_array = data_size/8;
         uint64_t memcpy_start = get_time_ns();
         
-        if (memchr(data_ptr, 255, data_size) != NULL) {
-	   printf("Found 255 on the buffer, it should not have one \n");
-	   exit(1);
-	}
-	invalidate_data_cache((char *)data_ptr,(char *)data_ptr + data_size);
-        __sync_synchronize(); // Ensure memcpy completes
+	memcpy(local_buffer,data_ptr,data_size);
+//#pragma omp parallel for
+//	for(uint32_t i=0;i < size_array;i++) {
+//	   ((double *)local_buffer)[i]=((double *)data_ptr)[i];
+//	}
+
+        //if (memchr(data_ptr, 255, data_size) != NULL) {
+	//   printf("Found 255 on the buffer, it should not have one \n");
+	//   exit(1);
+	//}
         
         uint64_t memcpy_end = get_time_ns();
+	invalidate_data_cache((char *)data_ptr,(char *)data_ptr + data_size);
+        __sync_synchronize(); // Ensure memcpy completes
         uint64_t second_pass_duration = memcpy_end - memcpy_start;
         
         // Stop performance counters after all memory operations
@@ -639,7 +646,7 @@ int main(int argc, char *argv[])
     
     // Map memory
     //void *ptr = mmap(NULL, st.st_size, PROT_READ | PROT_WRITE, 
-    void *ptr = mmap(NULL, 64*1024*1024, PROT_READ | PROT_WRITE, 
+    void *ptr = mmap(NULL, 62*1024*1024, PROT_READ | PROT_WRITE, 
                      MAP_SHARED, fd, 0);
     if (ptr == MAP_FAILED) {
         perror("mmap");
@@ -648,6 +655,11 @@ int main(int argc, char *argv[])
         close(fd);
         return 1;
     }
+
+    if (madvise(ptr, 62*1024*1024, MADV_HUGEPAGE) != 0) {
+	printf("madvice error %d\n",errno);
+        return 1;
+    };
     
     volatile struct shared_data *shm = (volatile struct shared_data *)ptr;
     

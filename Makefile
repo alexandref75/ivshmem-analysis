@@ -1,7 +1,7 @@
 .PHONY: all clean host guest deploy test
 
 CC = gcc
-CFLAGS = -Wall -O2 -std=c11
+CFLAGS = -Wall -O2 -std=c11 -mtune=native
 LDFLAGS = -lrt -lssl -lcrypto
 SSHFLAGS = -i temp_id_rsa -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
 SCPFLAGS = -i temp_id_rsa -P 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null

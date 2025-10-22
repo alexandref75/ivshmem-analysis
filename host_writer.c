@@ -275,6 +275,7 @@ void test_latency(volatile struct shared_data *shm, int iterations)
     
     // Use 4K frame (3840x2160x3 = 24.8MB) for latency test
     int width = 3840, height = 2160, bpp = 3;
+    //int width = 1440, height = 960, bpp = 3;
     size_t frame_size = width * height * bpp;
     
     if (frame_size > max_data_size) {

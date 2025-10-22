@@ -108,11 +108,11 @@ else
   elif [ -d /dev/shm ]; then
     echo "Creating shared memory file: /dev/shm/ivshmem (${IVSHMEM_SIZE}MB)"
     SHMEM_PATH=/dev/shm/ivshmem
+    sudo dd if=/dev/zero of=$SHMEM_PATH bs=1M count=$IVSHMEM_SIZE
   else
     echo "Creating shared memory file: $SHMEM_FILE (${IVSHMEM_SIZE}MB)"
     SHMEM_PATH=$SHMEM_FILE
   fi
-  #sudo dd if=/dev/zero of=$SHMEM_PATH bs=1M count=$IVSHMEM_SIZE
   sudo chmod a+rw $SHMEM_PATH 
   
   # Check if KVM is accessible

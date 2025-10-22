@@ -394,6 +394,7 @@ if [ $LAT_COUNT -gt 0 ]; then
 
   # Start guest reader for latency test only
   echo "Starting guest reader for latency test (${LAT_COUNT} iterations)..."
+  #ssh $SSH_OPTS $VM_USER "sudo perf stat -a -e cache-misses,cycles,instructions,dTLB,dTLB-misses /tmp/guest_reader -l $LAT_COUNT" > /tmp/guest_latency.log 2>&1 &
   ssh $SSH_OPTS $VM_USER "sudo /tmp/guest_reader -l $LAT_COUNT" > /tmp/guest_latency.log 2>&1 &
   LATENCY_GUEST_PID=$!
 

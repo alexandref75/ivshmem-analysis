@@ -103,9 +103,8 @@ struct shared_data {
     
     // Alignment and buffer
     uint8_t  padding[0];      // Let compiler handle alignment
-    char     _align[0] __attribute__((aligned(64)));
     
-    uint8_t  buffer[0];       // Actual data buffer
+    uint8_t  buffer[0] __attribute__((aligned(64)));
 };
 
 // State name conversion functions
